@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/bits"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // Comment this line to disable pprof endpoint.
@@ -48,12 +49,12 @@ import (
 	jprom "github.com/uber/jaeger-lib/metrics/prometheus"
 	"go.uber.org/atomic"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
-	"k8s.io/klog"
+	klog "k8s.io/klog"
+	klogv2 "k8s.io/klog/v2"
 
 	promlogflag "github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/discovery"
-	sd_config "github.com/prometheus/prometheus/discovery/config"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/logging"
@@ -67,6 +68,8 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/util/strutil"
 	"github.com/prometheus/prometheus/web"
+
+	_ "github.com/prometheus/prometheus/discovery/install" // Register service discovery implementations.
 )
 
 var (
@@ -238,6 +241,9 @@ func main() {
 	a.Flag("rules.alert.resend-delay", "Minimum amount of time to wait before resending an alert to Alertmanager.").
 		Default("1m").SetValue(&cfg.resendDelay)
 
+	a.Flag("scrape.adjust-timestamps", "Adjust scrape timestamps by up to 2ms to align them to the intended schedule. See https://github.com/prometheus/prometheus/issues/7846 for more context. Experimental. This flag will be removed in a future release.").
+		Hidden().Default("true").BoolVar(&scrape.AlignScrapeTimestamps)
+
 	a.Flag("alertmanager.notification-queue-capacity", "The capacity of the queue for pending Alertmanager notifications.").
 		Default("10000").IntVar(&cfg.notifier.QueueCapacity)
 
@@ -341,8 +347,14 @@ func main() {
 	// Above level 6, the k8s client would log bearer tokens in clear-text.
 	klog.ClampLevel(6)
 	klog.SetLogger(log.With(logger, "component", "k8s_client_runtime"))
+	klogv2.ClampLevel(6)
+	klogv2.SetLogger(log.With(logger, "component", "k8s_client_runtime"))
 
 	level.Info(logger).Log("msg", "Starting Prometheus", "version", version.Info())
+	if bits.UintSize < 64 {
+		level.Warn(logger).Log("msg", "This Prometheus binary has not been compiled for a 64-bit architecture. Due to virtual memory constraints of 32-bit systems, it is highly recommended to switch to a 64-bit binary of Prometheus.", "GOARCH", runtime.GOARCH)
+	}
+
 	level.Info(logger).Log("build_context", version.BuildContext())
 	level.Info(logger).Log("host_details", prom_runtime.Uname())
 	level.Info(logger).Log("fd_limits", prom_runtime.FdLimits())
@@ -466,9 +478,9 @@ func main() {
 		}, {
 			name: "scrape_sd",
 			reloader: func(cfg *config.Config) error {
-				c := make(map[string]sd_config.ServiceDiscoveryConfig)
+				c := make(map[string]discovery.Configs)
 				for _, v := range cfg.ScrapeConfigs {
-					c[v.JobName] = v.ServiceDiscoveryConfig
+					c[v.JobName] = v.ServiceDiscoveryConfigs
 				}
 				return discoveryManagerScrape.ApplyConfig(c)
 			},
@@ -478,9 +490,9 @@ func main() {
 		}, {
 			name: "notify_sd",
 			reloader: func(cfg *config.Config) error {
-				c := make(map[string]sd_config.ServiceDiscoveryConfig)
+				c := make(map[string]discovery.Configs)
 				for k, v := range cfg.AlertingConfig.AlertmanagerConfigs.ToMap() {
-					c[k] = v.ServiceDiscoveryConfig
+					c[k] = v.ServiceDiscoveryConfigs
 				}
 				return discoveryManagerNotify.ApplyConfig(c)
 			},
@@ -1026,11 +1038,13 @@ func (s *readyStorage) Appender(ctx context.Context) storage.Appender {
 
 type notReadyAppender struct{}
 
-func (n notReadyAppender) Add(l labels.Labels, t int64, v float64) (uint64, error) {
+func (n notReadyAppender) Add(l labels.Labels, m storage.Metadata, t int64, v float64) (uint64, error) {
 	return 0, tsdb.ErrNotReady
 }
 
-func (n notReadyAppender) AddFast(ref uint64, t int64, v float64) error { return tsdb.ErrNotReady }
+func (n notReadyAppender) AddFast(ref uint64, t int64, v float64) error {
+	return tsdb.ErrNotReady
+}
 
 func (n notReadyAppender) Commit() error { return tsdb.ErrNotReady }
 

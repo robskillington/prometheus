@@ -32,7 +32,9 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/wal"
 )
@@ -249,6 +251,7 @@ type QueueManager struct {
 
 	seriesMtx            sync.Mutex
 	seriesLabels         map[uint64]labels.Labels
+	seriesMetadata       map[uint64]storage.Metadata
 	seriesSegmentIndexes map[uint64]int
 	droppedSeries        map[uint64]struct{}
 
@@ -260,7 +263,9 @@ type QueueManager struct {
 
 	samplesIn, samplesDropped, samplesOut, samplesOutDuration *ewmaRate
 
-	metrics *queueManagerMetrics
+	metrics              *queueManagerMetrics
+	interner             *pool
+	highestRecvTimestamp *maxGauge
 }
 
 // NewQueueManager builds a new QueueManager.
@@ -276,6 +281,8 @@ func NewQueueManager(
 	relabelConfigs []*relabel.Config,
 	client WriteClient,
 	flushDeadline time.Duration,
+	interner *pool,
+	highestRecvTimestamp *maxGauge,
 ) *QueueManager {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -291,6 +298,7 @@ func NewQueueManager(
 		storeClient:    client,
 
 		seriesLabels:         make(map[uint64]labels.Labels),
+		seriesMetadata:       make(map[uint64]storage.Metadata),
 		seriesSegmentIndexes: make(map[uint64]int),
 		droppedSeries:        make(map[uint64]struct{}),
 
@@ -303,7 +311,9 @@ func NewQueueManager(
 		samplesOut:         newEWMARate(ewmaWeight, shardUpdateDuration),
 		samplesOutDuration: newEWMARate(ewmaWeight, shardUpdateDuration),
 
-		metrics: metrics,
+		metrics:              metrics,
+		interner:             interner,
+		highestRecvTimestamp: highestRecvTimestamp,
 	}
 
 	t.watcher = wal.NewWatcher(watcherMetrics, readerMetrics, logger, client.Name(), t, walDir)
@@ -328,6 +338,7 @@ outer:
 			t.seriesMtx.Unlock()
 			continue
 		}
+		meta, _ := t.seriesMetadata[s.Ref]
 		t.seriesMtx.Unlock()
 		// This will only loop if the queues are being resharded.
 		backoff := t.cfg.MinBackoff
@@ -340,6 +351,7 @@ outer:
 
 			if t.shards.enqueue(s.Ref, sample{
 				labels: lbls,
+				meta:   meta,
 				t:      s.T,
 				v:      s.V,
 			}) {
@@ -392,7 +404,10 @@ func (t *QueueManager) Stop() {
 	// On shutdown, release the strings in the labels from the intern pool.
 	t.seriesMtx.Lock()
 	for _, labels := range t.seriesLabels {
-		releaseLabels(labels)
+		t.releaseLabels(labels)
+	}
+	for _, meta := range t.seriesMetadata {
+		t.releaseMetadata(meta)
 	}
 	t.seriesMtx.Unlock()
 	t.metrics.unregister()
@@ -410,15 +425,36 @@ func (t *QueueManager) StoreSeries(series []record.RefSeries, index int) {
 			continue
 		}
 		t.seriesSegmentIndexes[s.Ref] = index
-		internLabels(lbls)
+		t.internLabels(lbls)
 
 		// We should not ever be replacing a series labels in the map, but just
 		// in case we do we need to ensure we do not leak the replaced interned
 		// strings.
 		if orig, ok := t.seriesLabels[s.Ref]; ok {
-			releaseLabels(orig)
+			t.releaseLabels(orig)
 		}
 		t.seriesLabels[s.Ref] = lbls
+	}
+}
+
+// StoreMetadata keeps track of the metadata on a per series basis.
+func (t *QueueManager) StoreMetadata(metadata []record.RefMetadata, index int) {
+	t.seriesMtx.Lock()
+	defer t.seriesMtx.Unlock()
+	for _, m := range metadata {
+		t.seriesSegmentIndexes[m.Ref] = index
+		meta := t.internMetadata(storage.Metadata{
+			Type: m.Type,
+			Unit: m.Unit,
+			Help: m.Help,
+		})
+
+		// Metadata can change, hence we should release the metadata
+		// if it has changed and is being replaced.
+		if orig, ok := t.seriesMetadata[m.Ref]; ok {
+			t.releaseMetadata(orig)
+		}
+		t.seriesMetadata[m.Ref] = meta
 	}
 }
 
@@ -433,8 +469,10 @@ func (t *QueueManager) SeriesReset(index int) {
 	for k, v := range t.seriesSegmentIndexes {
 		if v < index {
 			delete(t.seriesSegmentIndexes, k)
-			releaseLabels(t.seriesLabels[k])
+			t.releaseLabels(t.seriesLabels[k])
+			t.releaseMetadata(t.seriesMetadata[k])
 			delete(t.seriesLabels, k)
+			delete(t.seriesMetadata, k)
 			delete(t.droppedSeries, k)
 		}
 	}
@@ -454,18 +492,31 @@ func (t *QueueManager) client() WriteClient {
 	return t.storeClient
 }
 
-func internLabels(lbls labels.Labels) {
+func (t *QueueManager) internLabels(lbls labels.Labels) {
 	for i, l := range lbls {
-		lbls[i].Name = interner.intern(l.Name)
-		lbls[i].Value = interner.intern(l.Value)
+		lbls[i].Name = t.interner.intern(l.Name)
+		lbls[i].Value = t.interner.intern(l.Value)
 	}
 }
 
-func releaseLabels(ls labels.Labels) {
+func (t *QueueManager) releaseLabels(ls labels.Labels) {
 	for _, l := range ls {
-		interner.release(l.Name)
-		interner.release(l.Value)
+		t.interner.release(l.Name)
+		t.interner.release(l.Value)
 	}
+}
+
+func (t *QueueManager) internMetadata(meta storage.Metadata) storage.Metadata {
+	meta.Type = textparse.MetricType(t.interner.intern(string(meta.Type)))
+	meta.Unit = t.interner.intern(meta.Unit)
+	meta.Help = t.interner.intern(meta.Help)
+	return meta
+}
+
+func (t *QueueManager) releaseMetadata(meta storage.Metadata) {
+	t.interner.release(string(meta.Type))
+	t.interner.release(meta.Unit)
+	t.interner.release(meta.Help)
 }
 
 // processExternalLabels merges externalLabels into ls. If ls contains
@@ -564,7 +615,7 @@ func (t *QueueManager) calculateDesiredShards() int {
 		samplesOutDuration = t.samplesOutDuration.rate() / float64(time.Second)
 		samplesPendingRate = samplesInRate*samplesKeptRatio - samplesOutRate
 		highestSent        = t.metrics.highestSentTimestamp.Get()
-		highestRecv        = highestTimestamp.Get()
+		highestRecv        = t.highestRecvTimestamp.Get()
 		delay              = highestRecv - highestSent
 		samplesPending     = delay * samplesInRate * samplesKeptRatio
 	)
@@ -649,6 +700,7 @@ func (t *QueueManager) newShards() *shards {
 
 type sample struct {
 	labels labels.Labels
+	meta   storage.Metadata
 	t      int64
 	v      float64
 }
@@ -809,6 +861,9 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue chan sample) {
 			// retries endlessly, so once we reach max samples, if we can never send to the endpoint we'll
 			// stop reading from the queue. This makes it safe to reference pendingSamples by index.
 			pendingSamples[nPending].Labels = labelsToLabelsProto(sample.labels, pendingSamples[nPending].Labels)
+			pendingSamples[nPending].Type = metricTypeToMetricTypeProto(sample.meta.Type)
+			pendingSamples[nPending].Unit = sample.meta.Unit
+			pendingSamples[nPending].Help = sample.meta.Help
 			pendingSamples[nPending].Samples[0].Timestamp = sample.t
 			pendingSamples[nPending].Samples[0].Value = sample.v
 			nPending++

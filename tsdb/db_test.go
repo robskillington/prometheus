@@ -196,7 +196,7 @@ func TestDataAvailableOnlyAfterCommit(t *testing.T) {
 func TestNoPanicAfterWALCorrutpion(t *testing.T) {
 	db := openTestDB(t, &Options{WALSegmentSize: 32 * 1024}, nil)
 
-	// Append until the the first mmaped head chunk.
+	// Append until the first mmaped head chunk.
 	// This is to ensure that all samples can be read from the mmaped chunks when the WAL is corrupted.
 	var expSamples []tsdbutil.Sample
 	var maxt int64
@@ -1261,7 +1261,7 @@ func TestSizeRetention(t *testing.T) {
 	testutil.Equals(t, expSize, actSize, "registered size doesn't match actual disk size")
 
 	// Create a WAL checkpoint, and compare sizes.
-	first, last, err := db.Head().wal.Segments()
+	first, last, err := wal.Segments(db.Head().wal.Dir())
 	testutil.Ok(t, err)
 	_, err = wal.Checkpoint(log.NewNopLogger(), db.Head().wal, first, last-1, func(x uint64) bool { return false }, 0)
 	testutil.Ok(t, err)
@@ -2579,6 +2579,28 @@ func TestChunkWriter_ReadAfterWrite(t *testing.T) {
 	}
 }
 
+func TestRangeForTimestamp(t *testing.T) {
+	type args struct {
+		t     int64
+		width int64
+	}
+	tests := []struct {
+		args     args
+		expected int64
+	}{
+		{args{0, 5}, 5},
+		{args{1, 5}, 5},
+		{args{5, 5}, 10},
+		{args{6, 5}, 10},
+		{args{13, 5}, 15},
+		{args{95, 5}, 100},
+	}
+	for _, tt := range tests {
+		got := rangeForTimestamp(tt.args.t, tt.args.width)
+		testutil.Equals(t, tt.expected, got)
+	}
+}
+
 // TestChunkReader_ConcurrentReads checks that the chunk result can be read concurrently.
 // Regression test for https://github.com/prometheus/prometheus/pull/6514.
 func TestChunkReader_ConcurrentReads(t *testing.T) {
@@ -2708,6 +2730,111 @@ func deleteNonBlocks(dbDir string) error {
 			return errors.Errorf("root folder:%v still hase non block directory:%v", dbDir, dir.Name())
 		}
 	}
-
 	return nil
+}
+
+func TestOpen_VariousBlockStates(t *testing.T) {
+	tmpDir, err := ioutil.TempDir("", "test")
+	testutil.Ok(t, err)
+	t.Cleanup(func() {
+		testutil.Ok(t, os.RemoveAll(tmpDir))
+	})
+
+	var (
+		expectedLoadedDirs  = map[string]struct{}{}
+		expectedRemovedDirs = map[string]struct{}{}
+		expectedIgnoredDirs = map[string]struct{}{}
+	)
+
+	{
+		// Ok blocks; should be loaded.
+		expectedLoadedDirs[createBlock(t, tmpDir, genSeries(10, 2, 0, 10))] = struct{}{}
+		expectedLoadedDirs[createBlock(t, tmpDir, genSeries(10, 2, 10, 20))] = struct{}{}
+	}
+	{
+		// Block to repair; should be repaired & loaded.
+		dbDir := filepath.Join("testdata", "repair_index_version", "01BZJ9WJQPWHGNC2W4J9TA62KC")
+		outDir := filepath.Join(tmpDir, "01BZJ9WJQPWHGNC2W4J9TA62KC")
+		expectedLoadedDirs[outDir] = struct{}{}
+
+		// Touch chunks dir in block.
+		testutil.Ok(t, os.MkdirAll(filepath.Join(dbDir, "chunks"), 0777))
+		defer func() {
+			testutil.Ok(t, os.RemoveAll(filepath.Join(dbDir, "chunks")))
+		}()
+		testutil.Ok(t, os.Mkdir(outDir, os.ModePerm))
+		testutil.Ok(t, fileutil.CopyDirs(dbDir, outDir))
+	}
+	{
+		// Missing meta.json; should be ignored and only logged.
+		// TODO(bwplotka): Probably add metric.
+		dir := createBlock(t, tmpDir, genSeries(10, 2, 20, 30))
+		expectedIgnoredDirs[dir] = struct{}{}
+		testutil.Ok(t, os.Remove(filepath.Join(dir, metaFilename)))
+	}
+	{
+		// Tmp blocks during creation & deletion; those should be removed on start.
+		dir := createBlock(t, tmpDir, genSeries(10, 2, 30, 40))
+		testutil.Ok(t, fileutil.Replace(dir, dir+tmpForCreationBlockDirSuffix))
+		expectedRemovedDirs[dir+tmpForCreationBlockDirSuffix] = struct{}{}
+
+		// Tmp blocks during creation & deletion; those should be removed on start.
+		dir = createBlock(t, tmpDir, genSeries(10, 2, 40, 50))
+		testutil.Ok(t, fileutil.Replace(dir, dir+tmpForDeletionBlockDirSuffix))
+		expectedRemovedDirs[dir+tmpForDeletionBlockDirSuffix] = struct{}{}
+	}
+	{
+		// One ok block; but two should be replaced.
+		dir := createBlock(t, tmpDir, genSeries(10, 2, 50, 60))
+		expectedLoadedDirs[dir] = struct{}{}
+
+		m, _, err := readMetaFile(dir)
+		testutil.Ok(t, err)
+
+		compacted := createBlock(t, tmpDir, genSeries(10, 2, 50, 55))
+		expectedRemovedDirs[compacted] = struct{}{}
+
+		m.Compaction.Parents = append(m.Compaction.Parents,
+			BlockDesc{ULID: ulid.MustParse(filepath.Base(compacted))},
+			BlockDesc{ULID: ulid.MustNew(1, nil)},
+			BlockDesc{ULID: ulid.MustNew(123, nil)},
+		)
+
+		// Regression test: Already removed parent can be still in list, which was causing Open errors.
+		m.Compaction.Parents = append(m.Compaction.Parents, BlockDesc{ULID: ulid.MustParse(filepath.Base(compacted))})
+		m.Compaction.Parents = append(m.Compaction.Parents, BlockDesc{ULID: ulid.MustParse(filepath.Base(compacted))})
+		_, err = writeMetaFile(log.NewLogfmtLogger(os.Stderr), dir, m)
+		testutil.Ok(t, err)
+	}
+
+	opts := DefaultOptions()
+	opts.RetentionDuration = 0
+	db, err := Open(tmpDir, log.NewLogfmtLogger(os.Stderr), nil, opts)
+	testutil.Ok(t, err)
+
+	loadedBlocks := db.Blocks()
+
+	var loaded int
+	for _, l := range loadedBlocks {
+		if _, ok := expectedLoadedDirs[filepath.Join(tmpDir, l.meta.ULID.String())]; !ok {
+			t.Fatal("unexpected block", l.meta.ULID, "was loaded")
+		}
+		loaded++
+	}
+	testutil.Equals(t, len(expectedLoadedDirs), loaded)
+	testutil.Ok(t, db.Close())
+
+	files, err := ioutil.ReadDir(tmpDir)
+	testutil.Ok(t, err)
+
+	var ignored int
+	for _, f := range files {
+		if _, ok := expectedRemovedDirs[filepath.Join(tmpDir, f.Name())]; ok {
+			t.Fatal("expected", filepath.Join(tmpDir, f.Name()), "to be removed, but still exists")
+		}
+		if _, ok := expectedIgnoredDirs[filepath.Join(tmpDir, f.Name())]; ok {
+			ignored++
+		}
+	}
+	testutil.Equals(t, len(expectedIgnoredDirs), ignored)
 }

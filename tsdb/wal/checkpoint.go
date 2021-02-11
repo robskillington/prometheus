@@ -37,9 +37,11 @@ import (
 // CheckpointStats returns stats about a created checkpoint.
 type CheckpointStats struct {
 	DroppedSeries     int
+	DroppedMetadata   int
 	DroppedSamples    int
 	DroppedTombstones int
 	TotalSeries       int // Processed series including dropped ones.
+	TotalMetadata     int // Processed metadata including dropped ones.
 	TotalSamples      int // Processed samples including dropped ones.
 	TotalTombstones   int // Processed tombstones including dropped ones.
 }
@@ -145,16 +147,17 @@ func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id uint64) bo
 	r := NewReader(sgmReader)
 
 	var (
-		series  []record.RefSeries
-		samples []record.RefSample
-		tstones []tombstones.Stone
-		dec     record.Decoder
-		enc     record.Encoder
-		buf     []byte
-		recs    [][]byte
+		series   []record.RefSeries
+		metadata []record.RefMetadata
+		samples  []record.RefSample
+		tstones  []tombstones.Stone
+		dec      record.Decoder
+		enc      record.Encoder
+		buf      []byte
+		recs     [][]byte
 	)
 	for r.Next() {
-		series, samples, tstones = series[:0], samples[:0], tstones[:0]
+		series, metadata, samples, tstones = series[:0], metadata[:0], samples[:0], tstones[:0]
 
 		// We don't reset the buffer since we batch up multiple records
 		// before writing them to the checkpoint.
@@ -180,6 +183,24 @@ func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id uint64) bo
 			}
 			stats.TotalSeries += len(series)
 			stats.DroppedSeries += len(series) - len(repl)
+
+		case record.Metadata:
+			metadata, err = dec.Metadata(rec, metadata)
+			if err != nil {
+				return nil, errors.Wrap(err, "decode series")
+			}
+			// Drop irrelevant metadata in place.
+			repl := metadata[:0]
+			for _, m := range metadata {
+				if keep(m.Ref) {
+					repl = append(repl, m)
+				}
+			}
+			if len(repl) > 0 {
+				buf = enc.Metadata(repl, buf)
+			}
+			stats.TotalMetadata += len(metadata)
+			stats.DroppedMetadata += len(metadata) - len(repl)
 
 		case record.Samples:
 			samples, err = dec.Samples(rec, samples)
@@ -221,7 +242,8 @@ func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id uint64) bo
 			stats.DroppedTombstones += len(tstones) - len(repl)
 
 		default:
-			return nil, errors.New("invalid record type")
+			// Unknown record type, probably from a future Prometheus version.
+			continue
 		}
 		if len(buf[start:]) == 0 {
 			continue // All contents discarded.
@@ -249,6 +271,20 @@ func Checkpoint(logger log.Logger, w *WAL, from, to int, keep func(id uint64) bo
 	if err := cp.Close(); err != nil {
 		return nil, errors.Wrap(err, "close checkpoint")
 	}
+
+	// Sync temporary directory before rename.
+	df, err := fileutil.OpenDir(cpdirtmp)
+	if err != nil {
+		return nil, errors.Wrap(err, "open temporary checkpoint directory")
+	}
+	if err := df.Sync(); err != nil {
+		df.Close()
+		return nil, errors.Wrap(err, "sync temporary checkpoint directory")
+	}
+	if err = df.Close(); err != nil {
+		return nil, errors.Wrap(err, "close temporary checkpoint directory")
+	}
+
 	if err := fileutil.Replace(cpdirtmp, cpdir); err != nil {
 		return nil, errors.Wrap(err, "rename checkpoint directory")
 	}
